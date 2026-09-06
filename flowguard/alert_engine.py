@@ -15,6 +15,7 @@ from typing import List, Optional
 from .features import FlowFeatures
 from .features import FlowRecord
 from .models import ModelVerdict
+from .storage import AlertStore
 
 SEVERITY_MAP = {
     "benign": "info",
@@ -51,9 +52,10 @@ class Alert:
 
 
 class AlertEngine:
-    def __init__(self, benign_class: str = "benign"):
+    def __init__(self, benign_class: str = "benign", db_path: str = "flowguard_alerts.db"):
         self.benign_class = benign_class
         self.alerts: List[Alert] = []
+        self.store = AlertStore(db_path)
 
     def process(
         self, flow: FlowRecord, features: FlowFeatures, verdict: ModelVerdict
@@ -76,6 +78,7 @@ class AlertEngine:
             model_source=verdict.source,
         )
         self.alerts.append(alert)
+        self.store.insert_alert(alert)
         return alert
 
     def by_class(self, threat_class: str) -> List[Alert]:
