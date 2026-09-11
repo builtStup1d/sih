@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
     from .alert_engine import Alert
+    from .features import FlowRecord
 
 _CREATE_TABLE = """
 CREATE TABLE IF NOT EXISTS alerts (
@@ -199,6 +200,189 @@ class AlertStore:
         self._conn.close()
 
     def __enter__(self) -> AlertStore:
+        return self
+
+    def __exit__(self, *args) -> None:
+        self.close()
+
+    def clear(self) -> None:
+        """Delete all rows (used by the demo API reset endpoint)."""
+        self._conn.execute("DELETE FROM alerts")
+        self._conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# FlowStore — persists every raw traffic flow (real-time stream history).
+# ---------------------------------------------------------------------------
+
+_CREATE_FLOWS_TABLE = """
+CREATE TABLE IF NOT EXISTS flows (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    flow_id       TEXT    NOT NULL,
+    timestamp     REAL    NOT NULL,
+    src_ip        TEXT    NOT NULL,
+    dst_ip        TEXT    NOT NULL,
+    src_port      INTEGER NOT NULL,
+    dst_port      INTEGER NOT NULL,
+    protocol      TEXT    NOT NULL,
+    packet_count  INTEGER NOT NULL,
+    byte_count    INTEGER NOT NULL,
+    duration      REAL    NOT NULL,
+    tls_ja3       TEXT,
+    dns_query     TEXT,
+    ttl           INTEGER,
+    paired_alert  TEXT,
+    inserted_at   TEXT    DEFAULT CURRENT_TIMESTAMP
+)
+"""
+
+
+def _flow_row_to_dict(row: sqlite3.Row) -> Dict[str, object]:
+    return {
+        "id": row["id"],
+        "flow_id": row["flow_id"],
+        "timestamp": row["timestamp"],
+        "src_ip": row["src_ip"],
+        "dst_ip": row["dst_ip"],
+        "src_port": row["src_port"],
+        "dst_port": row["dst_port"],
+        "protocol": row["protocol"],
+        "packet_count": row["packet_count"],
+        "byte_count": row["byte_count"],
+        "duration": row["duration"],
+        "tls_ja3": row["tls_ja3"],
+        "dns_query": row["dns_query"],
+        "ttl": row["ttl"],
+        "paired_alert": row["paired_alert"],
+    }
+
+
+class FlowStore:
+    """SQLite-backed persistence for the raw (real-time) traffic stream."""
+
+    def __init__(self, db_path: str = "flowguard_flows.db") -> None:
+        self.db_path = db_path
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self.init_db()
+
+    def init_db(self) -> None:
+        self._conn.execute(_CREATE_FLOWS_TABLE)
+        self._conn.commit()
+
+    def insert_flow(
+        self, flow: FlowRecord, paired_alert: Optional[str] = None
+    ) -> None:
+        """Persist one flow. *paired_alert* holds the threat class name that the
+        analysis attached to this flow (None for benign traffic)."""
+        self._conn.execute(
+            "INSERT INTO flows (flow_id, timestamp, src_ip, dst_ip, src_port, "
+            "dst_port, protocol, packet_count, byte_count, duration, tls_ja3, "
+            "dns_query, ttl, paired_alert) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                flow.flow_id,
+                flow.timestamp,
+                flow.src_ip,
+                flow.dst_ip,
+                flow.src_port,
+                flow.dst_port,
+                flow.protocol,
+                flow.packet_count,
+                flow.byte_count,
+                flow.duration,
+                flow.tls_ja3,
+                flow.dns_query,
+                flow.ttl,
+                paired_alert,
+            ),
+        )
+        self._conn.commit()
+
+    def get_flows(
+        self,
+        limit: int = 100,
+        paired_alert: Optional[str] = None,
+    ) -> List[Dict[str, object]]:
+        """Most recent flows (newest first), optional threat-class filter."""
+        sql = "SELECT * FROM flows"
+        params: List = []
+        if paired_alert is not None:
+            sql += " WHERE paired_alert = ?"
+            params.append(paired_alert)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(int(limit))
+        rows = self._conn.execute(sql, params).fetchall()
+        return [_flow_row_to_dict(r) for r in rows]
+
+    def count(self) -> int:
+        row = self._conn.execute("SELECT COUNT(*) AS c FROM flows").fetchone()
+        return int(row["c"])
+
+    def total_bytes(self) -> int:
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(byte_count), 0) AS b FROM flows"
+        ).fetchone()
+        return int(row["b"])
+
+    def get_series(
+        self, bucket_seconds: int = 5, points: int = 60
+    ) -> List[Dict[str, object]]:
+        """Time-bucketed flow/byte/alert counts for time-series charts.
+
+        Only the last ``points`` buckets are returned (newest first).
+        """
+        rows = self._conn.execute(
+            "SELECT timestamp, byte_count, paired_alert FROM flows "
+            "ORDER BY timestamp ASC"
+        ).fetchall()
+        if not rows:
+            return []
+
+        buckets: Dict[int, Dict[str, object]] = {}
+        for r in rows:
+            key = int(r["timestamp"]) - (int(r["timestamp"]) % bucket_seconds)
+            b = buckets.setdefault(
+                key,
+                {"start": key, "flows": 0, "bytes": 0, "alerts": 0,
+                 "classes": {}},
+            )
+            b["flows"] = int(b["flows"]) + 1
+            b["bytes"] = int(b["bytes"]) + int(r["byte_count"])
+            cls = r["paired_alert"]
+            if cls:
+                b["alerts"] = int(b["alerts"]) + 1
+                classes = b["classes"]
+                classes[cls] = classes.get(cls, 0) + 1
+
+        from datetime import datetime, timezone
+
+        # Keep only the last `points` buckets; format start as ISO-8601.
+        keys = sorted(buckets)[-points:]
+        out: List[Dict[str, object]] = []
+        for k in keys:
+            b = buckets[k]
+            start = datetime.fromtimestamp(k, tz=timezone.utc).isoformat()
+            out.append(
+                {
+                    "start": start,
+                    "flows": b["flows"],
+                    "bytes": b["bytes"],
+                    "alerts": b["alerts"],
+                    "classes": b["classes"],
+                }
+            )
+        return out
+
+    def clear(self) -> None:
+        """Delete all rows (used by the demo API reset endpoint)."""
+        self._conn.execute("DELETE FROM flows")
+        self._conn.commit()
+
+    def close(self) -> None:
+        self._conn.close()
+
+    def __enter__(self) -> "FlowStore":
         return self
 
     def __exit__(self, *args) -> None:
