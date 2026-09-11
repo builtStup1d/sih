@@ -1,7 +1,36 @@
+# Python
 .venv/
 __pycache__/
 *.py[cod]
 *.egg-info/
+*.pyo
+
+# Environment
 .env
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+logs/
+
+# Data / runtime artifacts
 alerts.json
 alerts.csv
+flowguard_alerts.db
+flowguard_alerts.db-journal
+flowguard_flows.db
+
+# Dashboard
+dashboard/node_modules/
+dashboard/dist/
